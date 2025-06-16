@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Website Blocked</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+      background-color: #f0f2f5;
+      color: #333;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+      text-align: center;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    .container {
+      background-color: #fff;
+      padding: 40px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      max-width: 500px;
+    }
+    h1 {
+      color: #d93025; /* A reddish color for warning */
+      font-size: 24px;
+      margin-bottom: 15px;
+    }
+    p {
+      font-size: 16px;
+      line-height: 1.6;
+      margin-bottom: 25px;
+    }
+    .logo {
+        font-weight: bold;
+        font-size: 20px;
+        color: #1a73e8; /* A friendly blue */
+        margin-bottom: 20px;
+    }
+    a {
+      color: #1a73e8;
+      text-decoration: none;
+      font-weight: bold;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    #reasonText { /* Corrected from #reason to #reasonText to match JS */
+        font-style: italic;
+        color: #555;
+        margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">FocusGuard</div>
+    <h1>Website Blocked</h1>
+    <p>This website is currently blocked based on your FocusGuard settings.</p>
+    <p id="reasonText">You may have exceeded your daily or hourly browsing quota, or the site is on your block list.</p>
+    <p>Please check your settings or try again later. You can manage your settings by clicking on the FocusGuard extension icon in your browser toolbar.</p>
+    <!--
+      Future enhancement: Add a script here to try and load settings from chrome.storage.local
+      to display more specific quota info. For now, this static message is fine.
+    -->
+  </div>
+  <script>
+    // Optional: Try to get more specific info from URL query params if passed
+    const urlParams = new URLSearchParams(window.location.search);
+    const reason = urlParams.get('reason');
+    const domain = urlParams.get('domain');
+    const reasonTextElement = document.getElementById('reasonText');
+
+    if (domain) {
+        document.title = `Blocked: ${domain}`;
+    }
+
+    if (reason === 'no_quota_daily') {
+      reasonTextElement.textContent = 'Access denied: Your total daily browsing quota has been used.';
+    } else if (reason === 'no_quota_hourly') {
+      reasonTextElement.textContent = 'Access denied: Your allowed browsing time for the current hour has been used.';
+    } else if (reason === 'blocked' && domain) { // Check for domain for 'blocked' to make sense
+      reasonTextElement.textContent = `Access to ${domain} is restricted by your FocusGuard settings.`;
+    } else if (reason === 'blocked') {
+      reasonTextElement.textContent = 'Access to this site is restricted by your FocusGuard settings.';
+    }
+  </script>
+</body>
+</html>
