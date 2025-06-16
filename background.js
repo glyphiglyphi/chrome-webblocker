@@ -10,185 +10,97 @@ let settings = {
   extensionEnabled: true
 };
 
+let nextRuleId = 1;
+const REBLOCK_ALARM_PREFIX = 'reblock_alarm_';
+
 // Function to load all settings from storage into the in-memory cache
 function loadSettingsFromStorage() {
-  chrome.storage.local.get(null, (loadedSettings) => { // Get all keys
-    if (chrome.runtime.lastError) {
-      console.error("Error loading settings:", chrome.runtime.lastError);
-      return;
-    }
-    // Merge loaded settings with defaults to ensure all keys are present
-    settings = { ...settings, ...loadedSettings };
-    console.log('Settings loaded into memory:', settings);
+  return new Promise((resolve) => {
+    chrome.storage.local.get(null, (loadedSettings) => {
+      if (chrome.runtime.lastError) {
+        console.error("Error loading settings:", chrome.runtime.lastError);
+        resolve();
+        return;
+      }
+      settings = { ...settings, ...loadedSettings };
+      console.log('Settings loaded into memory:', settings);
+      resolve();
+    });
   });
 }
 
-// Load settings when the extension starts (not just installed)
-// This initial call helps if the extension was already enabled and browser restarts
-loadSettingsFromStorage();
+// Function to update declarativeNetRequest rules
+async function updateDeclarativeNetRequestRules() {
+  const newRules = [];
+  let currentRuleId = 1;
 
-// Listen for changes in storage and update the in-memory cache
-chrome.storage.onChanged.addListener((changes, namespace) => {
-  if (namespace === 'local') {
-    for (let key in changes) {
-      settings[key] = changes[key].newValue;
-    }
-    console.log('In-memory settings updated due to storage change:', settings);
-  }
-});
+  // If extension is disabled, remove all our rules and re-block alarms
+  if (!settings.extensionEnabled) {
+    const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
+    const ruleIdsToRemove = existingRules.map(rule => rule.id);
 
-// Listener for web requests
-chrome.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    if (details.type !== 'main_frame' || !details.url) {
-      return { cancel: false }; // Only act on main frame navigations
+    if (ruleIdsToRemove.length > 0) {
+      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ruleIdsToRemove });
+      console.log('Extension disabled, removed all dynamic rules.');
     }
 
-    if (!settings.extensionEnabled) {
-      return { cancel: false }; // Don't block if extension is disabled
-    }
-
-    const url = new URL(details.url);
-    const domain = url.hostname;
-
-    if (settings.blockedDomains && settings.blockedDomains.includes(domain)) {
-      console.log(`Checking domain: ${domain}`);
-      // Quota checks (using in-memory 'settings' for synchronous decision)
-      const now = new Date().getTime();
-
-      // Quota reset is handled by alarms. Values in 'settings' should be current.
-      const dailyQuotaAvailable = settings.currentDayUsedMinutes < settings.dailyQuotaMinutes;
-      const hourlyCapAvailable = settings.currentHourUsedMinutes < settings.hourlyUsageCapMinutes;
-
-      if (dailyQuotaAvailable && hourlyCapAvailable) {
-        const timeToGrant = settings.hourlyUsageCapMinutes;
-        const actualTimeSpentThisSession = Math.min(
-          timeToGrant,
-          settings.hourlyUsageCapMinutes - settings.currentHourUsedMinutes,
-          settings.dailyQuotaMinutes - settings.currentDayUsedMinutes
-        );
-
-        if (actualTimeSpentThisSession > 0) {
-          settings.currentHourUsedMinutes += actualTimeSpentThisSession;
-          settings.currentDayUsedMinutes += actualTimeSpentThisSession;
-          // settings.sessionStartTime = now; // Optional: if tracking session start
-
-          console.log(`Quota available for ${domain}. Granting ${actualTimeSpentThisSession} min. New usage H:${settings.currentHourUsedMinutes}, D:${settings.currentDayUsedMinutes}`);
-
-          chrome.storage.local.set({
-            currentHourUsedMinutes: settings.currentHourUsedMinutes,
-            currentDayUsedMinutes: settings.currentDayUsedMinutes,
-            // sessionStartTime: settings.sessionStartTime
-          }, () => {
-            if (chrome.runtime.lastError) {
-              console.error("Error saving time usage to storage:", chrome.runtime.lastError);
-            } else {
-              console.log("Time usage updated in storage.");
-            }
-          });
-          return { cancel: false };
-        } else {
-          console.log(`Quota available but calculated grant is 0 for ${domain}. Blocking.`);
+    const allAlarms = await chrome.alarms.getAll();
+    for (const alarm of allAlarms) {
+        if (alarm.name.startsWith(REBLOCK_ALARM_PREFIX)) {
+            await chrome.alarms.clear(alarm.name);
+            console.log(`Cleared re-block alarm: ${alarm.name}`);
         }
-      }
-
-      console.log(`Blocking ${domain}. No quota. Daily used: ${settings.currentDayUsedMinutes}/${settings.dailyQuotaMinutes}, Hourly used: ${settings.currentHourUsedMinutes}/${settings.hourlyUsageCapMinutes}`);
-
-      let blockReason = 'blocked';
-      if (!(settings.currentDayUsedMinutes < settings.dailyQuotaMinutes)) {
-          blockReason = 'no_quota_daily';
-      } else if (!(settings.currentHourUsedMinutes < settings.hourlyUsageCapMinutes)) {
-          blockReason = 'no_quota_hourly';
-      }
-
-      const redirectUrl = chrome.runtime.getURL(`blocked.html?reason=${blockReason}&domain=${encodeURIComponent(domain)}`);
-
-      // Ensure not to redirect the blocked page itself if it's trying to load resources
-      if (details.url.startsWith(chrome.runtime.getURL(''))) {
-        return {cancel: false};
-      }
-
-      return { redirectUrl: redirectUrl };
-
     }
-    return { cancel: false };
-  },
-  { urls: ["<all_urls>"], types: ["main_frame"] },
-  ["blocking"]
-);
-
-// --- Alarm Related Logic ---
-const HOURLY_RESET_ALARM_NAME = 'hourlyResetAlarm';
-const DAILY_RESET_ALARM_NAME = 'dailyResetAlarm';
-
-function setupAlarms() {
-  const now = new Date();
-
-  // Hourly Alarm: Target the start of the next hour
-  const minutesUntilNextHour = 60 - now.getMinutes();
-  const secondsUntilNextHour = 60 - now.getSeconds(); // For more precision
-  let delayInMinutesForHourly = minutesUntilNextHour;
-  if (secondsUntilNextHour > 0 && minutesUntilNextHour === 60) { // If exactly on the hour, wait a full hour
-     delayInMinutesForHourly = 60;
-  } else if (secondsUntilNextHour === 0 && now.getMinutes() === 0) { // If exactly on the hour, schedule for next hour
-     delayInMinutesForHourly = 60;
-  } else if (secondsUntilNextHour > 0 && minutesUntilNextHour > 0) {
-    // If we are at HH:MM:SS, delay should be to (HH+1):00:00
-    // delayInMinutesForHourly is already correct (e.g. at 10:45:30, it's 15 min to 11:00)
-    // but chrome.alarms.create uses 'delayInMinutes' which rounds down,
-    // so using 'when' for more precision is better.
+    return; // Stop further processing if disabled
   }
 
-
-  // More precise way to set the first alarm: calculate 'when'
-  const firstHourlyFire = new Date(now);
-  firstHourlyFire.setHours(now.getHours() + 1);
-  firstHourlyFire.setMinutes(0);
-  firstHourlyFire.setSeconds(0);
-  firstHourlyFire.setMilliseconds(0);
-  if (firstHourlyFire.getTime() <= now.getTime()) { // If current hour is e.g. 10:50, next hour is 11:00. If 10:00, next is 11:00
-      // if we are at 10:00:00, it should be 11:00:00.
-      // if we are at 10:00:01, it should be 11:00:00
-      // if we are at 10:59:59, it should be 11:00:00
-      // if Date.now() made it schedule for current hour or past, advance it
-      // This case should not happen if logic is: current hour + 1, then 0 minutes, 0 seconds
+  // If enabled, proceed to build rules for currently blocked domains
+  if (settings.blockedDomains && settings.blockedDomains.length > 0) {
+    settings.blockedDomains.forEach(domain => {
+      if (domain && typeof domain === 'string' && domain.trim() !== '') {
+        const cleanedDomain = domain.trim().replace(/^www\./i, '');
+        newRules.push({
+          id: currentRuleId++,
+          priority: 1,
+          action: {
+            type: 'redirect',
+            redirect: { extensionPath: '/blocked.html?reason=declarative_block&domain=' + encodeURIComponent(cleanedDomain) }
+          },
+          condition: {
+            urlFilter: `||${cleanedDomain}^`,
+            resourceTypes: ['main_frame']
+          }
+        });
+      } else {
+        console.warn("Skipping invalid domain for DNR rule:", domain);
+      }
+    });
   }
 
+  try {
+    const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
+    const ruleIdsToRemove = existingRules.map(rule => rule.id);
 
-  chrome.alarms.get(HOURLY_RESET_ALARM_NAME, (existingAlarm) => {
-    if (!existingAlarm || existingAlarm.scheduledTime !== firstHourlyFire.getTime() || existingAlarm.periodInMinutes !== 60) {
-        chrome.alarms.create(HOURLY_RESET_ALARM_NAME, {
-            when: firstHourlyFire.getTime(),
-            periodInMinutes: 60
+    if (ruleIdsToRemove.length > 0 || newRules.length > 0) {
+        await chrome.declarativeNetRequest.updateDynamicRules({
+            removeRuleIds: ruleIdsToRemove,
+            addRules: newRules
         });
-        console.log(`Set up ${HOURLY_RESET_ALARM_NAME}. Next fire: ${new Date(firstHourlyFire.getTime())}, then every 60 min.`);
+        console.log('DNR rules updated. Removed:', ruleIdsToRemove.length, 'Added:', newRules.length, newRules.map(r => r.condition.urlFilter));
     } else {
-        console.log(`${HOURLY_RESET_ALARM_NAME} already correctly scheduled.`);
+        console.log('No change to DNR rules needed.');
     }
-  });
-
-
-  // Daily Alarm: Target next midnight
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-  tomorrow.setHours(0, 0, 0, 0);
-  const periodDailyMinutes = 24 * 60;
-
-  chrome.alarms.get(DAILY_RESET_ALARM_NAME, (existingAlarm) => {
-    if(!existingAlarm || existingAlarm.scheduledTime !== tomorrow.getTime() || existingAlarm.periodInMinutes !== periodDailyMinutes) {
-        chrome.alarms.create(DAILY_RESET_ALARM_NAME, {
-            when: tomorrow.getTime(),
-            periodInMinutes: periodDailyMinutes
-        });
-        console.log(`Set up ${DAILY_RESET_ALARM_NAME}. Next fire: ${new Date(tomorrow.getTime())}, then every ${periodDailyMinutes} min.`);
-    } else {
-        console.log(`${DAILY_RESET_ALARM_NAME} already correctly scheduled.`);
+    nextRuleId = currentRuleId;
+  } catch (error) {
+    console.error("Error updating DNR rules:", error, error.stack);
+    if (error.message.includes("Invalid urlFilter")) {
+        console.error("Problematic domains list for DNR:", settings.blockedDomains);
     }
-  });
+  }
 }
 
-// Initialize settings on installation or startup, and set up alarms
-chrome.runtime.onInstalled.addListener((details) => {
+// Initialize settings on installation or startup
+chrome.runtime.onInstalled.addListener(async (details) => {
   console.log(`onInstalled event, reason: ${details.reason}`);
   if (details.reason === 'install') {
     const initialSettings = {
@@ -201,58 +113,204 @@ chrome.runtime.onInstalled.addListener((details) => {
       lastHourlyReset: new Date().getTime(),
       extensionEnabled: true
     };
-    chrome.storage.local.set(initialSettings, () => {
-      console.log('Default settings initialized.');
-      loadSettingsFromStorage(); // Load them into memory
-      setupAlarms(); // Then setup alarms
-    });
-  } else if (details.reason === 'update') {
-    loadSettingsFromStorage(); // Load on update
-    setupAlarms(); // Re-setup alarms on update
-  } else {
-    // This case handles other scenarios like browser update restarting the extension
-    loadSettingsFromStorage(); // Ensure settings are loaded
-    setupAlarms(); // And alarms are active
+    await new Promise(resolve => chrome.storage.local.set(initialSettings, resolve));
+    console.log('Default settings initialized.');
+  }
+  await loadSettingsFromStorage();
+  await updateDeclarativeNetRequestRules();
+  setupAlarms();
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  console.log("Extension startup detected.");
+  await loadSettingsFromStorage();
+  await updateDeclarativeNetRequestRules();
+  setupAlarms();
+});
+
+chrome.storage.onChanged.addListener(async (changes, namespace) => {
+  if (namespace === 'local') {
+    let rulesNeedUpdate = false;
+    let oldExtensionEnabledState = settings.extensionEnabled;
+
+    for (let key in changes) {
+      settings[key] = changes[key].newValue;
+      if (key === 'blockedDomains' || key === 'extensionEnabled') {
+        rulesNeedUpdate = true;
+      }
+    }
+    console.log('In-memory settings updated:', settings);
+    if (rulesNeedUpdate) {
+      // If extensionEnabled state changed from true to false, updateDeclarativeNetRequestRules will clear re-block alarms.
+      await updateDeclarativeNetRequestRules();
+    }
   }
 });
 
-// Setup alarms on extension startup (e.g., when browser starts)
-chrome.runtime.onStartup.addListener(() => {
-  console.log("Extension startup detected (chrome.runtime.onStartup).");
-  loadSettingsFromStorage(); // Ensure settings are fresh
-  setupAlarms(); // Setup alarms
+// Message listener
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === 'GET_QUOTA_STATUS') {
+    if (!settings.extensionEnabled) {
+      sendResponse({ quotaAvailable: false, reason: 'Extension is disabled.' });
+      return true;
+    }
+    const dailyQuotaAvailable = settings.currentDayUsedMinutes < settings.dailyQuotaMinutes;
+    const hourlyCapAvailable = settings.currentHourUsedMinutes < settings.hourlyUsageCapMinutes;
+
+    if (dailyQuotaAvailable && hourlyCapAvailable) {
+      const timeToGrant = Math.min(
+        settings.hourlyUsageCapMinutes - settings.currentHourUsedMinutes,
+        settings.dailyQuotaMinutes - settings.currentDayUsedMinutes
+      );
+      sendResponse({
+        quotaAvailable: true,
+        timeToGrant: timeToGrant > 0 ? timeToGrant : 0, // Ensure non-negative
+        minutesAvailableInHour: settings.hourlyUsageCapMinutes - settings.currentHourUsedMinutes,
+        minutesAvailableInDay: settings.dailyQuotaMinutes - settings.currentDayUsedMinutes
+      });
+    } else {
+      let reason = 'No quota available.';
+      if (!dailyQuotaAvailable) reason = 'Daily quota exceeded.';
+      else if (!hourlyCapAvailable) reason = 'Hourly quota for this hour exceeded.';
+      sendResponse({ quotaAvailable: false, reason: reason });
+    }
+    return true;
+  }
+  else if (request.type === 'UNLOCK_DOMAIN_REQUEST') {
+    const domainToUnlock = request.domain;
+    if (!settings.extensionEnabled) {
+      sendResponse({ unlocked: false, reason: 'Extension is disabled.' });
+      return true;
+    }
+
+    const dailyQuotaAvailable = settings.currentDayUsedMinutes < settings.dailyQuotaMinutes;
+    const hourlyCapAvailable = settings.currentHourUsedMinutes < settings.hourlyUsageCapMinutes;
+
+    if (domainToUnlock && dailyQuotaAvailable && hourlyCapAvailable) {
+      const timeToGrant = Math.min(
+        settings.hourlyUsageCapMinutes - settings.currentHourUsedMinutes,
+        settings.dailyQuotaMinutes - settings.currentDayUsedMinutes
+      );
+
+      if (timeToGrant <= 0) {
+        sendResponse({ unlocked: false, reason: 'No time available in current quota slots.' });
+        return true;
+      }
+
+      (async () => {
+        const originalBlockedDomains = [...settings.blockedDomains];
+        // Temporarily remove domain from list to update DNR rules
+        settings.blockedDomains = settings.blockedDomains.filter(d => d !== domainToUnlock);
+        await updateDeclarativeNetRequestRules(); // Update rules to unblock
+        settings.blockedDomains = originalBlockedDomains; // Restore for data integrity
+
+        settings.currentHourUsedMinutes += timeToGrant;
+        settings.currentDayUsedMinutes += timeToGrant;
+        await new Promise(resolve => chrome.storage.local.set({
+          currentHourUsedMinutes: settings.currentHourUsedMinutes,
+          currentDayUsedMinutes: settings.currentDayUsedMinutes
+        }, resolve));
+
+        const alarmName = `${REBLOCK_ALARM_PREFIX}${domainToUnlock}`;
+        chrome.alarms.create(alarmName, { delayInMinutes: timeToGrant });
+        console.log(`Domain ${domainToUnlock} unlocked for ${timeToGrant} mins. Alarm ${alarmName} set.`);
+        sendResponse({ unlocked: true, domain: domainToUnlock, grantedTime: timeToGrant });
+      })();
+
+      return true; // Async response
+    } else {
+      let reason = 'Not enough quota or domain invalid.';
+       if (!dailyQuotaAvailable) reason = 'Daily quota exceeded.';
+       else if (!hourlyCapAvailable) reason = 'Hourly quota for this hour exceeded.';
+      sendResponse({ unlocked: false, reason: reason });
+    }
+    return true;
+  }
+  return false; // Default for synchronous messages or if not handled
 });
 
-// Listener for alarms
-chrome.alarms.onAlarm.addListener((alarm) => {
+
+// --- Alarm Related Logic ---
+const HOURLY_RESET_ALARM_NAME = 'hourlyResetAlarm';
+const DAILY_RESET_ALARM_NAME = 'dailyResetAlarm';
+
+function setupAlarms() {
+  const now = new Date();
+  const firstHourlyFire = new Date(now);
+  firstHourlyFire.setHours(now.getHours() + 1);
+  firstHourlyFire.setMinutes(0);
+  firstHourlyFire.setSeconds(0);
+  firstHourlyFire.setMilliseconds(0);
+
+  chrome.alarms.get(HOURLY_RESET_ALARM_NAME, (existingAlarm) => {
+    if (!existingAlarm || existingAlarm.scheduledTime !== firstHourlyFire.getTime() || existingAlarm.periodInMinutes !== 60) {
+        chrome.alarms.create(HOURLY_RESET_ALARM_NAME, { when: firstHourlyFire.getTime(), periodInMinutes: 60 });
+        console.log(`Set/Updated ${HOURLY_RESET_ALARM_NAME}. Next: ${new Date(firstHourlyFire.getTime())}`);
+    }
+  });
+
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  tomorrow.setHours(0, 0, 0, 0);
+  chrome.alarms.get(DAILY_RESET_ALARM_NAME, (existingAlarm) => {
+    if(!existingAlarm || existingAlarm.scheduledTime !== tomorrow.getTime() || existingAlarm.periodInMinutes !== (24*60)) {
+        chrome.alarms.create(DAILY_RESET_ALARM_NAME, { when: tomorrow.getTime(), periodInMinutes: 24 * 60 });
+        console.log(`Set/Updated ${DAILY_RESET_ALARM_NAME}. Next: ${new Date(tomorrow.getTime())}`);
+    }
+  });
+}
+
+chrome.alarms.onAlarm.addListener(async (alarm) => { // Made async for await updateDeclarativeNetRequestRules
   const now = new Date().getTime();
   console.log(`Alarm fired: ${alarm.name} at ${new Date(now)}`);
+  let newStorageValues = {};
+  let needsStorageUpdate = false;
 
   if (alarm.name === HOURLY_RESET_ALARM_NAME) {
-    console.log('Hourly reset triggered.');
     settings.currentHourUsedMinutes = 0;
     settings.lastHourlyReset = now;
-    chrome.storage.local.set({
-      currentHourUsedMinutes: 0,
-      lastHourlyReset: now
-    }, () => {
-      console.log('Hourly usage reset in storage and memory.');
-    });
+    newStorageValues.currentHourUsedMinutes = 0;
+    newStorageValues.lastHourlyReset = now;
+    needsStorageUpdate = true;
   } else if (alarm.name === DAILY_RESET_ALARM_NAME) {
-    console.log('Daily reset triggered.');
     settings.currentDayUsedMinutes = 0;
-    settings.currentHourUsedMinutes = 0; // Daily reset also resets current hour's usage
+    settings.currentHourUsedMinutes = 0;
     settings.lastDailyReset = now;
     settings.lastHourlyReset = now;
-    chrome.storage.local.set({
-      currentDayUsedMinutes: 0,
-      currentHourUsedMinutes: 0,
-      lastDailyReset: now,
-      lastHourlyReset: now
-    }, () => {
-      console.log('Daily and hourly usage reset in storage and memory.');
-    });
+    newStorageValues.currentDayUsedMinutes = 0;
+    newStorageValues.currentHourUsedMinutes = 0;
+    newStorageValues.lastDailyReset = now;
+    newStorageValues.lastHourlyReset = now;
+    needsStorageUpdate = true;
+  } else if (alarm.name.startsWith(REBLOCK_ALARM_PREFIX)) {
+    const domainToReblock = alarm.name.substring(REBLOCK_ALARM_PREFIX.length);
+    console.log(`Re-block alarm for ${domainToReblock}.`);
+    // Ensure domain is in settings.blockedDomains (it should be due to how UNLOCK_DOMAIN_REQUEST works)
+    // Then call updateDeclarativeNetRequestRules to re-apply all blocking rules.
+    if (settings.extensionEnabled && !settings.blockedDomains.includes(domainToReblock)) {
+        // This state should ideally not be reached if logic is sound.
+        // However, as a safeguard:
+        // settings.blockedDomains.push(domainToReblock);
+        // await new Promise(resolve => chrome.storage.local.set({ blockedDomains: settings.blockedDomains }, resolve));
+        // console.warn(`Domain ${domainToReblock} was not in memory, added back for re-blocking.`);
+    }
+    // updateDeclarativeNetRequestRules will use settings.blockedDomains which should include the domain to re-block.
+    await updateDeclarativeNetRequestRules();
+    console.log(`Domain ${domainToReblock} should now be re-blocked.`);
+  }
+
+  if (needsStorageUpdate) {
+    await new Promise(resolve => chrome.storage.local.set(newStorageValues, () => {
+      if (chrome.runtime.lastError) console.error("Error in alarm storage update:", chrome.runtime.lastError);
+      else console.log('Usage reset/updated in storage due to alarm.');
+      resolve();
+    }));
   }
 });
 
-console.log('Background script now includes alarm setup and handling for quota resets.');
+(async () => {
+  await loadSettingsFromStorage();
+  await updateDeclarativeNetRequestRules();
+  setupAlarms();
+  console.log('FocusGuard background.js initialized (quota unlock features).');
+})();

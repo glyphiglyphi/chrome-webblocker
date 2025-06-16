@@ -2,13 +2,15 @@
   "manifest_version": 3,
   "name": "FocusGuard - Website Blocker",
   "version": "1.0",
-  "description": "Blocks specified websites and manages daily/hourly browsing quotas.",
+  "description": "Blocks specified websites and manages daily/hourly browsing quotas using Manifest V3.",
   "permissions": [
     "storage",
-    "webRequest",
-    "webRequestBlocking",
     "alarms",
-    "<all_urls>"
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "*://*/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -25,5 +27,14 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_1",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
   }
 }
